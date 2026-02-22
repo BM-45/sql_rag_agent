@@ -1,0 +1,8 @@
+__pycache__/
+agent_env/
+spider2-lite/
+.env 
+.claude/
+dataset_cache/
+chroma_db/
+test_db.sqlite

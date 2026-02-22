@@ -1,0 +1,26 @@
+datasets
+faker
+
+# frameworks
+langchain
+langchain-ollama
+langgraph
+langsmith
+
+# Environment variables triggering.
+python-dotenv
+
+# Dependencies for RAG Pipeline.
+langchain-chroma
+chromadb
+sentence-transformers
+
+
+# For showing web.
+fastapi
+streamlit
+uvicorn
+requests
+
+# tools for mcp.
+mcp
