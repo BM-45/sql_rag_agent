@@ -2,33 +2,28 @@ from datasets import load_dataset, load_from_disk
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from parse_schema_for_embedding import parse_schema_for_embedding
+from core.parse_schema_for_embedding import parse_schema_for_embedding
 import re
 import os
 import sqlite3
 from collections import defaultdict
 
 
-
-# ─────────────────────────────────────────────
-# 1. Download dataset once, cache locally
-# ─────────────────────────────────────────────
+# Caching the dataset to not again download from internet.
 
 DATASET_CACHE_PATH = "./dataset_cache"
 
 if os.path.exists(DATASET_CACHE_PATH):
-    print("📁 Loading dataset from local cache...")
+    print("Loading dataset from local cache...")
     dataset = load_from_disk(DATASET_CACHE_PATH)
 else:
-    print("⬇️  Downloading dataset (first time only)...")
+    print("Downloading dataset (first time only)...")
     dataset = load_dataset("b-mc2/sql-create-context", split="train")
     dataset.save_to_disk(DATASET_CACHE_PATH)
-    print(f"💾 Saved to {DATASET_CACHE_PATH}")
+    print(f"Saved to {DATASET_CACHE_PATH}")
 
 
-# ─────────────────────────────────────────────
-# 2. Filter generic table names
-# ─────────────────────────────────────────────
+# Filtering very generic names of tables, because semantic search is not working.
 
 def is_meaningful_table(context: str) -> bool:
     """Filter out generic table names like table_name_15, table_12434380_1"""
@@ -45,9 +40,7 @@ def is_meaningful_table(context: str) -> bool:
     return True
 
 
-# ─────────────────────────────────────────────
-# 3. Collect schemas and QA pairs
-# ─────────────────────────────────────────────
+# Collectig Unique schemas from the dataset.
 
 schema_to_questions = defaultdict(list)
 count = 0
@@ -65,9 +58,7 @@ print(f"Unique meaningful schemas: {len(unique_schemas)}")
 
 
 
-# ─────────────────────────────────────────────
-# 4. Select schemas (single-table, unique names, 2+ columns)
-# ─────────────────────────────────────────────
+# Only sample of datasets are considered.
 
 def select_schemas(schemas: list, limit: int = 10) -> list:
     """Pick schemas with unique table names, single table, 2+ columns."""
@@ -100,10 +91,7 @@ def select_schemas(schemas: list, limit: int = 10) -> list:
 selected_schemas = select_schemas(unique_schemas, limit=10)
 print(f"Selected schemas: {len(selected_schemas)}")
 
-
-# ─────────────────────────────────────────────
-# 5. ChromaDB data loading (now uses selected_schemas)
-# ─────────────────────────────────────────────
+# Ingesting to database.
 
 def data_loading(embedding_model, collection):
     """Load selected schemas into ChromaDB."""
@@ -139,9 +127,7 @@ def data_loading(embedding_model, collection):
         print(f"  Stored {end}/{len(selected_schemas)} schemas")
 
 
-# ─────────────────────────────────────────────
-# 5. SQLite creation with LLM-generated data
-# ─────────────────────────────────────────────
+# This code generates some meaningful data into database using local Ollama.
 
 DB_PATH = "test_db.sqlite"
 
@@ -187,7 +173,7 @@ def create_sqlite_db(schemas: list, db_path: str = DB_PATH):
                 if statement:
                     cursor.execute(statement)
         except Exception as e:
-            print(f"    ❌ CREATE failed: {e}")
+            print(f" CREATE failed: {e}")
             continue
 
         # Generate INSERT statements via LLM
@@ -203,27 +189,24 @@ def create_sqlite_db(schemas: list, db_path: str = DB_PATH):
                 except Exception as e:
                     continue
 
-            print(f"    ✅ {success} rows inserted")
+            print(f"  {success} rows inserted")
             created += 1
 
         except Exception as e:
-            print(f"    ❌ LLM failed: {e}")
+            print(f"   LLM failed: {e}")
             continue
 
     conn.commit()
     conn.close()
-    print(f"\n✅ Database: {db_path} | Tables: {created}/{len(schemas)}")
+    print(f"\nDatabase: {db_path} | Tables: {created}/{len(schemas)}")
 
 
-# ─────────────────────────────────────────────
-# 6. Run only when called directly
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    print(f"\n📦 Creating SQLite with LLM-generated data...")
+    print(f"\nCreating SQLite with LLM-generated data...")
     if os.path.exists(DB_PATH):
-        print(f"✅ Database already exists: {DB_PATH}, skipping creation.")
+        print(f"Database already exists: {DB_PATH}, skipping creation.")
     else:
-        print(f"\n📦 Creating SQLite with {len(selected_schemas)} tables (LLM-generated data)...")
+        print(f"\nCreating SQLite with {len(selected_schemas)} tables (LLM-generated data)...")
         create_sqlite_db(selected_schemas)

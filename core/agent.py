@@ -10,12 +10,10 @@ import sqlite3
 import json
 
 load_dotenv()
-from rag_retrieval import embed_model, collection
+from core.rag_retrieval import embed_model, collection
 
 
-# ═══════════════════════════════════════════════
-# 1. TOOLS
-# ═══════════════════════════════════════════════
+# Defining tools and addign traces to it.
 
 
 @tool
@@ -88,17 +86,13 @@ def execute_sql(query: str) -> str:
         return f"SQL EXECUTION ERROR: {str(e)}. Fix the query and try again."
 
 
-# ═══════════════════════════════════════════════
-# 2. STATE
-# ═══════════════════════════════════════════════
+# state defining.
 
 class SqlAgent(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-# ═══════════════════════════════════════════════
-# 3. LLM SETUP
-# ═══════════════════════════════════════════════
+# Setting up LLM.
 
 SYSTEM_PROMPT = """You are a SQL analytics agent. Your job is to answer questions about data by querying a database.
 
@@ -128,9 +122,7 @@ llm = ChatOllama(
 ).bind_tools(tools)
 
 
-# ═══════════════════════════════════════════════
-# 4. GRAPH NODES
-# ═══════════════════════════════════════════════
+# Defining workflow.
 
 MAX_ITERATIONS = 10
 
@@ -181,9 +173,7 @@ def tool_node(state: SqlAgent) -> dict:
     return {"messages": results}
 
 
-# ═══════════════════════════════════════════════
-# 5. ROUTING
-# ═══════════════════════════════════════════════
+# This step is routing.
 
 @traceable(name="should_continue", run_type="chain")
 def should_continue(state: SqlAgent) -> str:
@@ -196,9 +186,7 @@ def should_continue(state: SqlAgent) -> str:
     return "end"
 
 
-# ═══════════════════════════════════════════════
-# 6. BUILD GRAPH
-# ═══════════════════════════════════════════════
+# Buidling the graph using langgraph framework.
 
 sql_workflow = StateGraph(SqlAgent)
 
@@ -216,9 +204,7 @@ sql_workflow.add_edge("tools", "agent")
 app = sql_workflow.compile()
 
 
-# ═══════════════════════════════════════════════
-# 7. RUN
-# ═══════════════════════════════════════════════
+# Runnnig it.
 
 @traceable(name="ask_agent", run_type="chain")
 def ask(question: str, verbose: bool = True) -> str:
@@ -234,15 +220,15 @@ def ask(question: str, verbose: bool = True) -> str:
         print(f"{'─'*60}")
         for msg in result["messages"]:
             if isinstance(msg, HumanMessage):
-                print(f"\n👤 USER: {msg.content}")
+                print(f"\n USER: {msg.content}")
             elif isinstance(msg, AIMessage):
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
-                        print(f"\n🧠 AGENT calls: {tc['name']}({json.dumps(tc['args'])})")
+                        print(f"\nAGENT calls: {tc['name']}({json.dumps(tc['args'])})")
                 elif msg.content:
-                    print(f"\n🧠 AGENT answer: {msg.content}")
+                    print(f"\nAGENT answer: {msg.content}")
             elif isinstance(msg, ToolMessage):
-                print(f"\n🔧 TOOL result: {msg.content[:150]}...")
+                print(f"\nTOOL result: {msg.content[:150]}...")
 
     # Extract final answer
     final_answer = ""
@@ -253,7 +239,7 @@ def ask(question: str, verbose: bool = True) -> str:
 
     if verbose:
         print(f"\n{'─'*60}")
-        print(f"📋 FINAL ANSWER: {final_answer}")
+        print(f"FINAL ANSWER: {final_answer}")
         print(f"{'─'*60}")
 
     return final_answer

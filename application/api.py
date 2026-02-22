@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage
-from agent import app as agent_app
+from core.agent import app as agent_app
 import uuid
 import os
 

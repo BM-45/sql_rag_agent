@@ -1,5 +1,5 @@
-from data_loading import schema_to_questions
-from rag_retrieval import embed_model, collection
+from core.data_loading import schema_to_questions
+from core.rag_retrieval import embed_model, collection
 
 # Test Retrieval
 # ─────────────────────────────────────────────

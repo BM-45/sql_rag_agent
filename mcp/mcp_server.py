@@ -1,15 +1,3 @@
-"""
-MCP Server — SQL RAG Agent Tools
-==================================
-Exposes search_schema, execute_sql tools to Claude Desktop.
-
-pip install mcp
-python mcp_server.py
-
-Then add to Claude Desktop config:
-  ~/Library/Application Support/Claude/claude_desktop_config.json
-"""
-
 from mcp.server.fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -17,9 +5,7 @@ import sqlite3
 import re
 import os
 
-# ─────────────────────────────────────────────
-# Setup
-# ─────────────────────────────────────────────
+# Setup.
 
 mcp = FastMCP("SQL RAG Agent")
 
@@ -32,16 +18,14 @@ DB_PATH = os.path.join(PROJECT_DIR, "test_db.sqlite")
 
 try:
     collection = chroma_client.get_collection("table_schemas")
-    print(f"✅ ChromaDB loaded: {collection.count()} schemas")
+    print(f"ChromaDB loaded: {collection.count()} schemas")
 except:
     collection = None
-    print("⚠️  ChromaDB collection not found. Run rag_retrieval.py first.")
+    print("ChromaDB collection not found. Run rag_retrieval.py first.")
 
 
 
-# ─────────────────────────────────────────────
-# Tools
-# ─────────────────────────────────────────────
+# Tools.
 
 @mcp.tool()
 def search_schema(question: str) -> str:
@@ -118,9 +102,7 @@ def list_tables() -> str:
         return f"ERROR: {str(e)}"
 
 
-# ─────────────────────────────────────────────
-# Run
-# ─────────────────────────────────────────────
+# Run.
 
 if __name__ == "__main__":
     mcp.run()

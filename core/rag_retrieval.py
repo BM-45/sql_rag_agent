@@ -1,6 +1,6 @@
 import chromadb
 from sentence_transformers import SentenceTransformer
-from data_loading import data_loading
+from core.data_loading import data_loading
 
 # These are always available for import
 embed_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
