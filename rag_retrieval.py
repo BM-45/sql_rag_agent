@@ -1,6 +1,6 @@
 import chromadb
 from sentence_transformers import SentenceTransformer
-from data_loading import data_loading
+from data_loading import data_loading, load_documents_to_chromadb
 
 # These are always available for import
 embed_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
@@ -23,4 +23,6 @@ if __name__ == "__main__":
         metadata={"description": "SQL table schemas for RAG retrieval", "hnsw:space": "cosine"}
     )
     data_loading(embed_model, collection)
+    load_documents_to_chromadb(embed_model, collection)
     print(f"Done! Stored {collection.count()} schemas")
+

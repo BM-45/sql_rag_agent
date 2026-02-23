@@ -9,10 +9,61 @@ import sqlite3
 from collections import defaultdict
 
 
+DOCS_PATH = "./documents"
 
-# ─────────────────────────────────────────────
+def load_documents_to_chromadb(embedding_model, collection):
+    """Load text/PDF documents into ChromaDB alongside schemas."""
+    if not os.path.exists(DOCS_PATH):
+        os.makedirs(DOCS_PATH)
+        print(f"Created {DOCS_PATH}/ folder. Add your .txt or .pdf files there.")
+        return
+
+    files = [f for f in os.listdir(DOCS_PATH) if f.endswith((".txt", ".md", ".pdf"))]
+    if not files:
+        print("No documents found in documents/ folder.")
+        return
+
+    for filename in files:
+        filepath = os.path.join(DOCS_PATH, filename)
+
+        # Parse
+        if filename.endswith(".pdf"):
+            from pypdf import PdfReader
+            reader = PdfReader(filepath)
+            text = "".join([page.extract_text() or "" for page in reader.pages])
+        else:
+            with open(filepath, "r") as f:
+                text = f.read()
+
+        # Chunk
+        words = text.split()
+        chunks = []
+        for i in range(0, len(words), 250):
+            chunk = " ".join(words[i:i + 300])
+            if chunk.strip():
+                chunks.append(chunk.strip())
+
+        # Embed and store
+        for i, chunk in enumerate(chunks):
+            embedding = embedding_model.encode([chunk]).tolist()
+            collection.add(
+                ids=[f"doc_{filename}_{i}"],
+                documents=[chunk],
+                embeddings=embedding,
+                metadatas=[{
+                    "type": "business_rule",
+                    "source": filename,
+                    "original_context": chunk
+                }]
+            )
+
+        print(f"  Stored {len(chunks)} chunks from {filename}")
+
+
+
+
 # 1. Download dataset once, cache locally
-# ─────────────────────────────────────────────
+
 
 DATASET_CACHE_PATH = "./dataset_cache"
 
@@ -26,9 +77,9 @@ else:
     print(f"💾 Saved to {DATASET_CACHE_PATH}")
 
 
-# ─────────────────────────────────────────────
+
 # 2. Filter generic table names
-# ─────────────────────────────────────────────
+
 
 def is_meaningful_table(context: str) -> bool:
     """Filter out generic table names like table_name_15, table_12434380_1"""
@@ -45,9 +96,8 @@ def is_meaningful_table(context: str) -> bool:
     return True
 
 
-# ─────────────────────────────────────────────
 # 3. Collect schemas and QA pairs
-# ─────────────────────────────────────────────
+
 
 schema_to_questions = defaultdict(list)
 count = 0
@@ -65,9 +115,9 @@ print(f"Unique meaningful schemas: {len(unique_schemas)}")
 
 
 
-# ─────────────────────────────────────────────
+
 # 4. Select schemas (single-table, unique names, 2+ columns)
-# ─────────────────────────────────────────────
+
 
 def select_schemas(schemas: list, limit: int = 10) -> list:
     """Pick schemas with unique table names, single table, 2+ columns."""
@@ -101,9 +151,8 @@ selected_schemas = select_schemas(unique_schemas, limit=10)
 print(f"Selected schemas: {len(selected_schemas)}")
 
 
-# ─────────────────────────────────────────────
 # 5. ChromaDB data loading (now uses selected_schemas)
-# ─────────────────────────────────────────────
+
 
 def data_loading(embedding_model, collection):
     """Load selected schemas into ChromaDB."""
@@ -139,9 +188,9 @@ def data_loading(embedding_model, collection):
         print(f"  Stored {end}/{len(selected_schemas)} schemas")
 
 
-# ─────────────────────────────────────────────
+
 # 5. SQLite creation with LLM-generated data
-# ─────────────────────────────────────────────
+
 
 DB_PATH = "test_db.sqlite"
 
@@ -215,9 +264,9 @@ def create_sqlite_db(schemas: list, db_path: str = DB_PATH):
     print(f"\n✅ Database: {db_path} | Tables: {created}/{len(schemas)}")
 
 
-# ─────────────────────────────────────────────
+
 # 6. Run only when called directly
-# ─────────────────────────────────────────────
+
 
 if __name__ == "__main__":
 

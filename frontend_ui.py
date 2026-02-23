@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-st.title("SQL Agent")
+st.title("Analytics Agent")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -29,6 +29,6 @@ if question := st.chat_input("Ask a question..."):
                 trace_url = ""
         st.write(answer)
         if trace_url:
-            st.markdown(f"[🔍 View Trace]({trace_url})")
+            st.markdown(f"[View Trace]({trace_url})")
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "trace_url": trace_url})

@@ -13,29 +13,40 @@ load_dotenv()
 from rag_retrieval import embed_model, collection
 
 
-# ═══════════════════════════════════════════════
+
 # 1. TOOLS
-# ═══════════════════════════════════════════════
+
 
 
 @tool
 @traceable(name="search_schema", run_type="tool")
 def search_schema(question: str) -> str:
-    """Search the database for relevant table schemas based on a natural language question.
+    """Search the database for relevant table schemas and business documents.
     Use this tool FIRST to find which tables are available before writing SQL.
-    Returns the top 3 matching table schemas."""
+    Returns matching schemas and any relevant business rules from uploaded documents."""
 
     if collection is None:
         return "ERROR: ChromaDB collection not initialized"
 
     query_embedding = embed_model.encode([question]).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=3)
+    results = collection.query(query_embeddings=query_embedding, n_results=5)
 
     schemas = []
-    for meta, distance in zip(results["metadatas"][0], results["distances"][0]):
-        schemas.append(f"[distance: {distance:.4f}] {meta['original_context']}")
+    doc_chunks = []
 
-    return "\n\n".join(schemas)
+    for meta, distance in zip(results["metadatas"][0], results["distances"][0]):
+        if meta.get("type") == "business_rule":
+            doc_chunks.append(f"[{meta.get('source', 'document')}] {meta['original_context']}")
+        else:
+            schemas.append(f"[distance: {distance:.4f}] {meta['original_context']}")
+
+    output = ""
+    if schemas:
+        output += "TABLE SCHEMAS:\n" + "\n\n".join(schemas)
+    if doc_chunks:
+        output += "\n\nBUSINESS RULES FROM DOCUMENTS:\n" + "\n\n".join(doc_chunks)
+
+    return output if output else "No matching schemas or documents found."
 
 
 @tool
@@ -86,51 +97,60 @@ def execute_sql(query: str) -> str:
 
     except Exception as e:
         return f"SQL EXECUTION ERROR: {str(e)}. Fix the query and try again."
+    
+@tool
+def list_tables() -> str:
+    """List all tables in the database. Use this when the user asks what tables exist."""
+    conn = sqlite3.connect("test_db.sqlite")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return f"Available tables: {tables}"
 
 
-# ═══════════════════════════════════════════════
+
 # 2. STATE
-# ═══════════════════════════════════════════════
+
 
 class SqlAgent(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-# ═══════════════════════════════════════════════
+
 # 3. LLM SETUP
-# ═══════════════════════════════════════════════
 
-SYSTEM_PROMPT = """You are a SQL analytics agent. Your job is to answer questions about data by querying a database.
 
-WORKFLOW — follow these steps in order:
-1. Use search_schema to find relevant table schemas
-2. Write a SQL query based on the schema
-3. Use validate_sql to check the query is safe
-4. Use execute_sql to run the query
-5. Respond with the answer in natural language
+SYSTEM_PROMPT = """SYSTEM_PROMPT = You are a Analytics agent. You can answer questions from databases AND from uploaded business documents.
+
+WORKFLOW:
+1. Use search_schema to find relevant table schemas OR document content
+2. If the result contains BUSINESS RULES FROM DOCUMENTS, use that to answer directly
+3. If the result contains TABLE SCHEMAS, write a SQL query, validate it, and execute it
+4. If the question is general (greetings, help), just answer directly without tools
 
 RULES:
-- ALWAYS search for schemas first, never guess table or column names
-- ALWAYS validate before executing
-- If validation fails, read the error message carefully and fix the query
-- If execution fails, read the error and try a different approach
+- Use search_schema first to check if relevant info exists
+- If documents contain the answer, respond from documents. No SQL needed.
+- If tables contain the answer, generate SQL, validate, then execute
+- Use list_tables if the user asks what data is available
 - Only use SELECT statements
-- Use exact column and table names from the schema
-- Maximum 3 retry attempts, then explain what went wrong"""
+- Maximum 3 retry attempts"""
 
-tools = [search_schema, validate_sql, execute_sql]
+tools = [search_schema, validate_sql, execute_sql, list_tables]
 tool_map = {t.name: t for t in tools}
 
 llm = ChatOllama(
-    model="qwen3:4b",
+    model="qwen3:1.7b",
     temperature=0,
-    num_predict=1024
+    num_predict=512,
+    extra_body={"chat_template": "qwen3-no-think"}  # or add /no_think to prompt
 ).bind_tools(tools)
 
 
-# ═══════════════════════════════════════════════
+
 # 4. GRAPH NODES
-# ═══════════════════════════════════════════════
+
 
 MAX_ITERATIONS = 10
 
@@ -181,9 +201,9 @@ def tool_node(state: SqlAgent) -> dict:
     return {"messages": results}
 
 
-# ═══════════════════════════════════════════════
+
 # 5. ROUTING
-# ═══════════════════════════════════════════════
+
 
 @traceable(name="should_continue", run_type="chain")
 def should_continue(state: SqlAgent) -> str:
@@ -196,9 +216,9 @@ def should_continue(state: SqlAgent) -> str:
     return "end"
 
 
-# ═══════════════════════════════════════════════
+
 # 6. BUILD GRAPH
-# ═══════════════════════════════════════════════
+
 
 sql_workflow = StateGraph(SqlAgent)
 
@@ -216,9 +236,9 @@ sql_workflow.add_edge("tools", "agent")
 app = sql_workflow.compile()
 
 
-# ═══════════════════════════════════════════════
+
 # 7. RUN
-# ═══════════════════════════════════════════════
+
 
 @traceable(name="ask_agent", run_type="chain")
 def ask(question: str, verbose: bool = True) -> str:
@@ -234,13 +254,13 @@ def ask(question: str, verbose: bool = True) -> str:
         print(f"{'─'*60}")
         for msg in result["messages"]:
             if isinstance(msg, HumanMessage):
-                print(f"\n👤 USER: {msg.content}")
+                print(f"\n USER: {msg.content}")
             elif isinstance(msg, AIMessage):
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
-                        print(f"\n🧠 AGENT calls: {tc['name']}({json.dumps(tc['args'])})")
+                        print(f"\n AGENT calls: {tc['name']}({json.dumps(tc['args'])})")
                 elif msg.content:
-                    print(f"\n🧠 AGENT answer: {msg.content}")
+                    print(f"\n AGENT answer: {msg.content}")
             elif isinstance(msg, ToolMessage):
                 print(f"\n🔧 TOOL result: {msg.content[:150]}...")
 
@@ -253,7 +273,7 @@ def ask(question: str, verbose: bool = True) -> str:
 
     if verbose:
         print(f"\n{'─'*60}")
-        print(f"📋 FINAL ANSWER: {final_answer}")
+        print(f" FINAL ANSWER: {final_answer}")
         print(f"{'─'*60}")
 
     return final_answer
