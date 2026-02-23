@@ -27,3 +27,6 @@ mcp
 
 # Tools for pypdf.
 pypdf
+
+# framework
+ragas
