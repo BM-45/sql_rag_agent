@@ -24,3 +24,6 @@ requests
 
 # tools for mcp.
 mcp
+
+# Tools for pypdf.
+pypdf

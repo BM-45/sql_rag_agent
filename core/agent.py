@@ -1,73 +1,246 @@
+# SQL RAG Agent - Deterministic Pipeline with Intent Classification
+# Supports business document context passed from API layer
+#
+# Flow:
+#   classify -> GENERAL  -> general_answer -> END
+#            -> METADATA -> metadata_answer -> END
+#            -> SQL      -> retrieve -> generate -> validate -> execute -> format -> END
+
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated
-from langgraph.graph import add_messages
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langchain_core.tools import tool
+from typing import TypedDict
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langsmith import traceable
 from dotenv import load_dotenv
 import sqlite3
-import json
+import re
 
 load_dotenv()
 from core.rag_retrieval import embed_model, collection
 
 
-# Defining tools and addign traces to it.
+# State
+
+class AgentState(TypedDict):
+    question: str
+    intent: str
+    doc_context: str
+    schema: str
+    generated_sql: str
+    is_valid: bool
+    error_message: str
+    retry_count: int
+    query_results: str
+    answer: str
 
 
-@tool
-@traceable(name="search_schema", run_type="tool")
-def search_schema(question: str) -> str:
-    """Search the database for relevant table schemas based on a natural language question.
-    Use this tool FIRST to find which tables are available before writing SQL.
-    Returns the top 3 matching table schemas."""
+# LLM
 
-    if collection is None:
-        return "ERROR: ChromaDB collection not initialized"
+llm = ChatOllama(
+    model="qwen3:4b",
+    temperature=0,
+    num_predict=512
+)
 
+
+# Node 1: Classify intent using LLM
+
+@traceable(name="classify_question", run_type="chain")
+def classify_question(state: AgentState) -> dict:
+    question = state["question"]
+    doc_context = state.get("doc_context", "")
+
+    context_note = "No documents uploaded."
+    if doc_context:
+        context_note = f"User has uploaded documents with this content:\n{doc_context[:500]}"
+
+    system_msg = f"""/no_think
+You are a query intent classifier. Classify the user question into exactly one category.
+
+Categories:
+- SQL: questions that need data from a database (counts, averages, filters, comparisons, rankings)
+- METADATA: questions about what tables, columns, or data is available
+- DOCUMENT: questions that can be answered from the uploaded document content below
+- GENERAL: greetings, help requests, or questions about your capabilities
+
+{context_note}
+
+Respond with ONLY one word: SQL or METADATA or DOCUMENT or GENERAL"""
+
+    # Debug logging
+    print(f"\n[CLASSIFIER] Question: {question}")
+    print(f"[CLASSIFIER] Has doc_context: {bool(doc_context)}")
+    print(f"[CLASSIFIER] Doc context preview: {doc_context[:200] if doc_context else 'EMPTY'}")
+
+    response = llm.invoke([
+        SystemMessage(content=system_msg),
+        HumanMessage(content=question)
+    ])
+
+    raw_response = response.content.strip()
+    print(f"[CLASSIFIER] Raw LLM response: '{raw_response}'")
+
+    intent = raw_response.upper()
+    intent = re.sub(r'<think>.*?</think>', '', intent, flags=re.DOTALL).strip()
+    print(f"[CLASSIFIER] After cleanup: '{intent}'")
+
+    if intent not in ("SQL", "METADATA", "DOCUMENT", "GENERAL"):
+        print(f"[CLASSIFIER] '{intent}' not in valid list, defaulting to SQL")
+        intent = "SQL"
+
+    if intent == "DOCUMENT" and not doc_context:
+        print(f"[CLASSIFIER] DOCUMENT but no context, falling back to GENERAL")
+        intent = "GENERAL"
+
+    print(f"[CLASSIFIER] Final intent: {intent}")
+    return {"intent": intent}
+
+# Router
+
+def route_question(state: AgentState) -> str:
+    intent = state.get("intent", "SQL")
+    if intent == "METADATA":
+        return "metadata_answer"
+    if intent == "GENERAL":
+        return "general_answer"
+    return "retrieve_schema"
+
+
+# GENERAL branch
+
+@traceable(name="general_answer", run_type="chain")
+def general_answer(state: AgentState) -> dict:
+    response = llm.invoke([
+        SystemMessage(content="""/no_think
+You are a SQL analytics agent. You help users query databases using natural language.
+Answer briefly and helpfully."""),
+        HumanMessage(content=state["question"])
+    ])
+
+    answer = response.content.strip()
+    answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+    return {"answer": answer}
+
+
+# METADATA branch
+
+@traceable(name="metadata_answer", run_type="chain")
+def metadata_answer(state: AgentState) -> dict:
+    try:
+        conn = sqlite3.connect("test_db.sqlite")
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = []
+
+        for (name,) in cursor.fetchall():
+            cursor.execute(f'PRAGMA table_info("{name}")')
+            cols = [f"{row[1]} ({row[2]})" for row in cursor.fetchall()]
+            cursor.execute(f'SELECT COUNT(*) FROM "{name}"')
+            count = cursor.fetchone()[0]
+            tables.append(f"{name} ({count} rows): {', '.join(cols)}")
+
+        conn.close()
+        table_info = "\n".join(tables)
+
+        response = llm.invoke([
+            SystemMessage(content="""/no_think
+You are a helpful SQL agent. Given table metadata, answer the user's question about what data is available. Be concise."""),
+            HumanMessage(content=f"User question: {state['question']}\n\nAvailable tables:\n{table_info}")
+        ])
+
+        answer = response.content.strip()
+        answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+        return {"answer": answer}
+
+    except Exception as e:
+        return {"answer": f"Could not fetch table info: {str(e)}"}
+
+
+# SQL Node 1: Retrieve schema from ChromaDB
+
+@traceable(name="retrieve_schema", run_type="chain")
+def retrieve_schema(state: AgentState) -> dict:
+    question = state["question"]
     query_embedding = embed_model.encode([question]).tolist()
     results = collection.query(query_embeddings=query_embedding, n_results=3)
 
     schemas = []
-    for meta, distance in zip(results["metadatas"][0], results["distances"][0]):
-        schemas.append(f"[distance: {distance:.4f}] {meta['original_context']}")
+    for meta in results["metadatas"][0]:
+        schemas.append(meta["original_context"])
 
-    return "\n\n".join(schemas)
+    return {"schema": "\n\n".join(schemas)}
 
 
-@tool
-@traceable(name="validate_sql", run_type="tool")
-def validate_sql(query: str) -> str:
-    """Validate that a SQL query is safe to execute.
-    Use this BEFORE running any SQL query.
-    Returns 'VALID' if safe, or an error message explaining what's wrong."""
+# SQL Node 2: LLM generates SQL query (uses doc_context if available)
 
+@traceable(name="generate_sql", run_type="chain")
+def generate_sql(state: AgentState) -> dict:
+    question = state["question"]
+    schema = state["schema"]
+    doc_context = state.get("doc_context", "")
+    error = state.get("error_message", "")
+
+    prompt = f"Schema:\n{schema}\n\nQuestion: {question}"
+
+    if doc_context:
+        prompt += f"\n\nBusiness rules from uploaded documents (use these for calculations and logic):\n{doc_context}"
+
+    if error:
+        prompt += f"\n\nPrevious attempt failed with error: {error}\nFix the query."
+
+    response = llm.invoke([
+        SystemMessage(content="""/no_think
+You are a SQL query generator. Given a table schema and a question, generate ONLY a SQL SELECT query.
+If business rules are provided, use them for calculations (formulas, definitions, date ranges).
+No explanations. No markdown. Just the SQL query."""),
+        HumanMessage(content=prompt)
+    ])
+
+    sql = response.content.strip()
+    sql = re.sub(r'<think>.*?</think>', '', sql, flags=re.DOTALL).strip()
+    sql = sql.replace("```sql", "").replace("```", "").strip()
+
+    return {"generated_sql": sql}
+
+
+# SQL Node 3: Validate SQL (code only)
+
+@traceable(name="validate_sql", run_type="chain")
+def validate_sql(state: AgentState) -> dict:
+    query = state["generated_sql"]
     upper = query.upper().strip()
 
     if not upper.startswith("SELECT"):
-        return "ERROR: Only SELECT statements are allowed. Your query starts with: " + upper.split()[0]
+        return {
+            "is_valid": False,
+            "error_message": "Only SELECT statements allowed",
+            "retry_count": state.get("retry_count", 0) + 1
+        }
 
-    dangerous = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE", "EXEC", "--"]
+    dangerous = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE"]
     for kw in dangerous:
         if kw in upper:
-            return f"ERROR: Dangerous keyword '{kw}' detected. Remove it and try again."
-  
-    if len(query.strip()) < 10:
-        return "ERROR: Query is too short. Write a complete SQL query."
+            return {
+                "is_valid": False,
+                "error_message": f"Dangerous keyword {kw} found",
+                "retry_count": state.get("retry_count", 0) + 1
+            }
 
     if "FROM" not in upper:
-        return "ERROR: Query missing FROM clause. SQL needs: SELECT ... FROM table_name"
+        return {
+            "is_valid": False,
+            "error_message": "Missing FROM clause",
+            "retry_count": state.get("retry_count", 0) + 1
+        }
 
-    return f"VALID: Query passed all safety checks. Safe to execute: {query}"
+    return {"is_valid": True, "error_message": ""}
 
 
-@tool
-@traceable(name="execute_sql", run_type="tool")
-def execute_sql(query: str) -> str:
-    """Execute a validated SQL query against the database.
-    Only use this AFTER validate_sql returns 'VALID'.
-    Returns the query results."""
+# SQL Node 4: Execute SQL (no retry)
+
+@traceable(name="execute_sql", run_type="chain")
+def execute_sql(state: AgentState) -> dict:
+    query = state["generated_sql"]
 
     try:
         conn = sqlite3.connect("test_db.sqlite")
@@ -78,180 +251,138 @@ def execute_sql(query: str) -> str:
         conn.close()
 
         if not results:
-            return "Query returned no results."
+            return {"query_results": "No results found."}
 
-        return f"Columns: {columns}\nResults: {results[:20]}"
+        return {"query_results": f"Columns: {columns}\nResults: {results[:20]}"}
 
     except Exception as e:
-        return f"SQL EXECUTION ERROR: {str(e)}. Fix the query and try again."
+        return {"query_results": f"SQL execution failed: {str(e)}"}
 
 
-# state defining.
+# SQL Node 5: Format answer using LLM
 
-class SqlAgent(TypedDict):
-    messages: Annotated[list, add_messages]
+@traceable(name="format_answer", run_type="chain")
+def format_answer(state: AgentState) -> dict:
+    question = state["question"]
+    sql = state["generated_sql"]
+    results = state.get("query_results", "")
+    doc_context = state.get("doc_context", "")
 
+    if not results:
+        return {"answer": "Could not get results."}
 
-# Setting up LLM.
+    prompt = f"Question: {question}\nSQL: {sql}\nResults: {results}\n\nGive a short natural language answer."
 
-SYSTEM_PROMPT = """You are a SQL analytics agent. Your job is to answer questions about data by querying a database.
+    if doc_context:
+        prompt += f"\n\nBusiness context (use if relevant to explain the answer):\n{doc_context}"
 
-WORKFLOW — follow these steps in order:
-1. Use search_schema to find relevant table schemas
-2. Write a SQL query based on the schema
-3. Use validate_sql to check the query is safe
-4. Use execute_sql to run the query
-5. Respond with the answer in natural language
+    response = llm.invoke([
+        SystemMessage(content="/no_think\nYou summarize SQL results into short natural language answers. No markdown."),
+        HumanMessage(content=prompt)
+    ])
 
-RULES:
-- ALWAYS search for schemas first, never guess table or column names
-- ALWAYS validate before executing
-- If validation fails, read the error message carefully and fix the query
-- If execution fails, read the error and try a different approach
-- Only use SELECT statements
-- Use exact column and table names from the schema
-- Maximum 3 retry attempts, then explain what went wrong"""
-
-tools = [search_schema, validate_sql, execute_sql]
-tool_map = {t.name: t for t in tools}
-
-llm = ChatOllama(
-    model="qwen3:4b",
-    temperature=0,
-    num_predict=1024
-).bind_tools(tools)
+    answer = response.content.strip()
+    answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+    return {"answer": answer}
 
 
-# Defining workflow.
+# Validation routing
 
-MAX_ITERATIONS = 10
-
-
-@traceable(name="agent_node", run_type="chain")
-def agent_node(state: SqlAgent) -> dict:
-    """LLM reasons and decides what to do next."""
-    messages = state["messages"]
-
-    if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
-
-    tool_call_count = sum(
-        1 for m in messages
-        if hasattr(m, "tool_calls") and m.tool_calls
-    )
-    if tool_call_count >= MAX_ITERATIONS:
-        return {
-            "messages": [AIMessage(content="I've reached the maximum number of attempts. Please try rephrasing your question.")]
-        }
-
-    response = llm.invoke(messages)
-    return {"messages": [response]}
+def after_validate(state: AgentState) -> str:
+    if state["is_valid"]:
+        return "execute_sql"
+    if state.get("retry_count", 0) >= 1:
+        return "format_answer"
+    return "generate_sql"
 
 
-@traceable(name="tool_node", run_type="chain")
-def tool_node(state: SqlAgent) -> dict:
-    """Execute whatever tool(s) the LLM chose."""
-    last_message = state["messages"][-1]
-    results = []
+# Build graph
 
-    for call in last_message.tool_calls:
-        tool_name = call["name"]
-        tool_args = call["args"]
+sql_workflow = StateGraph(AgentState)
 
-        try:
-            result = tool_map[tool_name].invoke(tool_args)
-        except Exception as e:
-            result = f"TOOL ERROR: {str(e)}. Try a different approach."
+sql_workflow.add_node("classify_question", classify_question)
+sql_workflow.add_node("general_answer", general_answer)
+sql_workflow.add_node("metadata_answer", metadata_answer)
+sql_workflow.add_node("retrieve_schema", retrieve_schema)
+sql_workflow.add_node("generate_sql", generate_sql)
+sql_workflow.add_node("validate_sql", validate_sql)
+sql_workflow.add_node("execute_sql", execute_sql)
+sql_workflow.add_node("format_answer", format_answer)
 
-        results.append(
-            ToolMessage(
-                content=str(result),
-                tool_call_id=call["id"]
-            )
-        )
+sql_workflow.add_edge(START, "classify_question")
 
-    return {"messages": results}
-
-
-# This step is routing.
-
-@traceable(name="should_continue", run_type="chain")
-def should_continue(state: SqlAgent) -> str:
-    """Decide: does LLM want to use a tool, or is it done?"""
-    last_message = state["messages"][-1]
-
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tools"
-
-    return "end"
-
-
-# Buidling the graph using langgraph framework.
-
-sql_workflow = StateGraph(SqlAgent)
-
-sql_workflow.add_node("agent", agent_node)
-sql_workflow.add_node("tools", tool_node)
-
-sql_workflow.add_edge(START, "agent")
 sql_workflow.add_conditional_edges(
-    "agent",
-    should_continue,
-    {"tools": "tools", "end": END}
+    "classify_question",
+    route_question,
+    {
+        "general_answer": "general_answer",
+        "metadata_answer": "metadata_answer",
+        "retrieve_schema": "retrieve_schema"
+    }
 )
-sql_workflow.add_edge("tools", "agent")
+
+sql_workflow.add_edge("general_answer", END)
+sql_workflow.add_edge("metadata_answer", END)
+sql_workflow.add_edge("retrieve_schema", "generate_sql")
+sql_workflow.add_edge("generate_sql", "validate_sql")
+
+sql_workflow.add_conditional_edges(
+    "validate_sql",
+    after_validate,
+    {
+        "execute_sql": "execute_sql",
+        "generate_sql": "generate_sql",
+        "format_answer": "format_answer"
+    }
+)
+
+sql_workflow.add_edge("execute_sql", "format_answer")
+sql_workflow.add_edge("format_answer", END)
 
 app = sql_workflow.compile()
 
 
-# Runnnig it.
+# Run
 
 @traceable(name="ask_agent", run_type="chain")
-def ask(question: str, verbose: bool = True) -> str:
-    """Ask the agent a question and get an answer."""
-
+def ask(question: str, doc_context: str = "", verbose: bool = True) -> str:
     result = app.invoke({
-        "messages": [HumanMessage(content=question)]
+        "question": question,
+        "intent": "",
+        "doc_context": doc_context,
+        "schema": "",
+        "generated_sql": "",
+        "is_valid": False,
+        "error_message": "",
+        "retry_count": 0,
+        "query_results": "",
+        "answer": ""
     })
 
     if verbose:
-        print(f"\n{'─'*60}")
-        print("CONVERSATION TRACE:")
-        print(f"{'─'*60}")
-        for msg in result["messages"]:
-            if isinstance(msg, HumanMessage):
-                print(f"\n USER: {msg.content}")
-            elif isinstance(msg, AIMessage):
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        print(f"\nAGENT calls: {tc['name']}({json.dumps(tc['args'])})")
-                elif msg.content:
-                    print(f"\nAGENT answer: {msg.content}")
-            elif isinstance(msg, ToolMessage):
-                print(f"\nTOOL result: {msg.content[:150]}...")
+        print(f"\nIntent: {result['intent']}")
+        if result.get("doc_context"):
+            print(f"Doc context: {result['doc_context'][:100]}...")
+        if result.get("schema"):
+            print(f"Schema: {result['schema'][:100]}...")
+        if result.get("generated_sql"):
+            print(f"SQL: {result['generated_sql']}")
+        if result.get("query_results"):
+            print(f"Results: {result['query_results'][:200]}")
+        print(f"Answer: {result['answer']}")
 
-    # Extract final answer
-    final_answer = ""
-    for msg in reversed(result["messages"]):
-        if isinstance(msg, AIMessage) and msg.content and not (hasattr(msg, "tool_calls") and msg.tool_calls):
-            final_answer = msg.content
-            break
-
-    if verbose:
-        print(f"\n{'─'*60}")
-        print(f"FINAL ANSWER: {final_answer}")
-        print(f"{'─'*60}")
-
-    return final_answer
+    return result["answer"]
 
 
 if __name__ == "__main__":
     questions = [
+        "Hello, what can you do?",
+        "What tables do you have access to?",
         "Which city has highest population?",
     ]
 
     for q in questions:
-        print(f"\n\n{'═'*60}")
+        print(f"\n{'='*60}")
         print(f"USER: {q}")
-        print(f"{'═'*60}")
+        print(f"{'='*60}")
         answer = ask(q)
